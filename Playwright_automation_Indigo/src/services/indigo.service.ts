@@ -117,6 +117,7 @@ async function fillBookingForm(
 
   const pnrInput = page.locator(SEL.PNR_INPUT);
   const lastNameInput = page.locator(SEL.LAST_NAME_INPUT);
+  await page.waitForTimeout(2000);
 
   await pnrInput.clear();
   await pnrInput.fill(pnr);
@@ -152,10 +153,11 @@ async function waitForItineraryPage(page: Page, pnr: string): Promise<void> {
   }
 
   // Wait for itinerary confirmation text
-  await page.waitForSelector(SEL.ITINERARY_LOADED, {
-    state: "visible",
-    timeout: 0,
-  });
+  // await page.waitForSelector(SEL.ITINERARY_LOADED, {
+  //   state: "visible",
+  //   timeout: 0,
+  // });
+  await page.waitForLoadState('domcontentloaded');
 
   logger.debug("Itinerary page loaded successfully");
 }
@@ -176,7 +178,7 @@ async function clickNoShowAndCapturePopup(
   logger.debug(`Checking for No-Show button — PNR: ${pnr}`);
 
   console.log("Checking for text for Noshow");
-  await page.waitForTimeout(8000);
+  await page.waitForTimeout(10000);
   // await page.waitForLoadState('networkidle');
 
   // await page.waitForSelector('p:has-text("Your itinerary is generated")', {
@@ -205,7 +207,8 @@ async function clickNoShowAndCapturePopup(
 
   // CRITICAL: capturePopupOnClick sets up listeners BEFORE clicking,
   // then clicks, then awaits the toast. This is the fix for the 2-3s popup.
-  const popupResult = await capturePopupOnClick(page, btn);
+  const popupResult = await capturePopupOnClick(page, btn, pnr, matchedName);
+  await page.waitForTimeout(4000);
 
   return { found: true, popupResult };
 }

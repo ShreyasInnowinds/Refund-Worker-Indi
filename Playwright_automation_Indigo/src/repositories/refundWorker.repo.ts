@@ -78,6 +78,32 @@ export class RefundWorkerRepo {
   }
 
   /**
+   * Create or reset a worker record (upsert on name).
+   * If worker already exists, resets it to IDEL status.
+   */
+  async createWorker(
+    name: string,
+    seq: number,
+    batchId: string
+  ): Promise<IRefundWorker> {
+    const worker = await RefundWorkerModel.findOneAndUpdate(
+      { name },
+      {
+        $set: {
+          seq,
+          assignedBatch: batchId,
+          status: "IDEL",
+          startedAt: null,
+          completedAt: null,
+        },
+      },
+      { upsert: true, new: true }
+    );
+    logger.info(`Worker record created/reset: ${name} for batch ${batchId}`);
+    return worker as IRefundWorker;
+  }
+
+  /**
    * Mark worker as FAILED and set completedAt.
    */
   async markFailed(workerId: string): Promise<void> {

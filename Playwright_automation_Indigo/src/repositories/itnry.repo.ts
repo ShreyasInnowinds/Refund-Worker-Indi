@@ -122,6 +122,38 @@ export class ItnryRepo {
   }
 
   /**
+   * Atomically fetch and lock ONE eligible task from the queue.
+   * Uses findOneAndUpdate so no two workers can pick the same task.
+   */
+  async fetchAndLockTask(
+    batchId: string,
+    workerName: string
+  ): Promise<IItnry | null> {
+    const task = await ItnryModel.findOneAndUpdate(
+      {
+        batchId,
+        Status: "NoShow",
+        refundWorkerStatus: "NEW",
+      },
+      {
+        $set: {
+          refundWorkerStatus: "IN_PROGRESS",
+          lockedBy: workerName,
+          LockedAt: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (task) {
+      logger.debug(
+        `Fetched & locked task: PNR=${task.pnr} by ${workerName}`
+      );
+    }
+    return task;
+  }
+
+  /**
    * Mark record as FAILED after exhausting retries.
    */
   async markFailed(recordId: string): Promise<void> {
