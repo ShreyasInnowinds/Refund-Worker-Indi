@@ -2,10 +2,10 @@
  * runWorker.ts — CLI entry point
  *
  * Usage:
- *   npm run start -- --batchId=26-03-2026-7L9A
+ *   npm run start -- --workerName=26-03-2026-7L9A-w1
  *
  * or after build:
- *   node dist/scripts/runWorker.js --batchId=26-03-2026-7L9A
+ *   node dist/scripts/runWorker.js --workerName=26-03-2026-7L9A-w1
  */
 
 import yargs from "yargs";
@@ -17,18 +17,18 @@ import { logger } from "../utils/logger";
 
 async function main(): Promise<void> {
   const argv = await yargs(hideBin(process.argv))
-    .option("batchId", {
+    .option("workerName", {
       type: "string",
       demandOption: true,
-      describe: "Batch ID to process (e.g., 26-03-2026-7L9A)",
+      describe: "Worker name from refund_worker collection (e.g., 26-03-2026-7L9A-w1)",
     })
     .strict()
     .help()
     .parseAsync();
 
-  const batchId = argv.batchId;
+  const workerName = argv.workerName;
 
-  logger.info(`CLI started with batchId: ${batchId}`);
+  logger.info(`CLI started with workerName: ${workerName}`);
   logger.info(`MongoDB: ${ENV.MONGO_URI}/${ENV.DB_NAME}`);
   logger.info(`Headless: ${ENV.BROWSER_HEADLESS} | MaxRetries: ${ENV.MAX_RETRIES}`);
 
@@ -37,7 +37,7 @@ async function main(): Promise<void> {
     await connectDB();
 
     // Run the worker
-    await runRefundWorker(batchId);
+    await runRefundWorker(workerName);
 
     logger.info("Worker completed successfully");
   } catch (error: any) {
