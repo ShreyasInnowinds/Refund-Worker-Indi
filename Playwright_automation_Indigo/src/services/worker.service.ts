@@ -1,38 +1,42 @@
 /**
  * worker.service.ts
  *
- * Orchestrates the refund processing pipeline:
- *   1. Fetch eligible records from itnry
- *   2. Launch a shared Playwright browser
- *   3. Process each record sequentially (new context per record)
- *   4. Save results to refund_book + update itnry status
+ * Multi-worker queue system:
+ *   1. Launch ONE browser instance
+ *   2. Spawn N workers, each with its own browser context
+ *   3. Each worker loops: fetch task atomically → process → update → repeat
+ *   4. Workers stop when no more tasks are available
+ *   5. All workers run concurrently via Promise.allSettled
  *
- * Retry policy:
- *   - System errors (timeouts, navigation failures) → retry up to MAX_RETRIES
- *   - Business errors (already refunded, IndiGo error popup) → NO retry
+ * Architecture:
+ *   Single Browser
+ *   ├── Context 1 → Worker 1 (loop: fetchAndLock → process → update)
+ *   ├── Context 2 → Worker 2
+ *   └── Context N → Worker N
+ *   All workers pull from the same DB queue using atomic findOneAndUpdate
+ *
+ * Error handling:
+ *   - Browser errors (timeout, navigation, net::, etc.) → retry up to MAX_RETRIES → "browserError"
+ *   - Business results (Success, Already_Refunded)       → NO retry, save as-is
+ *   - Other application errors                           → NO retry, save as "Error"
+ *   - Each worker handles its own errors — no worker crashes the system
  */
 
-import { chromium, Browser, BrowserContext } from "playwright";
+import { chromium, Browser, Page } from "playwright";
 import { ItnryRepo, IItnry } from "../repositories/itnry.repo";
 import { RefundRepo, RefundBookInput } from "../repositories/refund.repo";
+import { RefundWorkerRepo } from "../repositories/refundWorker.repo";
 import { runIndigoAutomation, AutomationResult } from "./indigo.service";
 import { ENV } from "../config/env";
 import { logger } from "../utils/logger";
 
 const itnryRepo = new ItnryRepo();
 const refundRepo = new RefundRepo();
+const refundWorkerRepo = new RefundWorkerRepo();
 
-// ── Business error detection ─────────────────────────────────────────────────
-// These are NOT retryable — the result is final.
+// ── Error classification ────────────────────────────────────────────────────
 
-function isBusinessError(result: AutomationResult): boolean {
-  return (
-    result.finalStatus === "Already_Refunded" ||
-    result.finalStatus === "Success"
-  );
-}
-
-function isSystemError(error: Error): boolean {
+function isBrowserError(error: Error): boolean {
   const msg = error.message.toLowerCase();
   return (
     msg.includes("timeout") ||
@@ -40,177 +44,285 @@ function isSystemError(error: Error): boolean {
     msg.includes("net::") ||
     msg.includes("target closed") ||
     msg.includes("browser has been closed") ||
-    msg.includes("execution context was destroyed")
+    msg.includes("execution context was destroyed") ||
+    msg.includes("frame was detached") ||
+    msg.includes("page crashed") ||
+    msg.includes("protocol error") ||
+    msg.includes("session closed")
   );
 }
 
-// ── Process a single record ──────────────────────────────────────────────────
+// ── Process a single record (already locked by fetchAndLockTask) ────────────
 
 async function processRecord(
-  page: any,
-  record: IItnry
+  page: Page,
+  record: IItnry,
+  workerName: string
 ): Promise<void> {
   const pnr = record.pnr;
   const matchedName = record.matchedName || "";
   const recordId = (record._id as any).toString();
 
-  logger.info(`━━━ START processing PNR: ${pnr} | Name: ${matchedName} ━━━`);
-
-  // Attempt to lock the record atomically
-  const locked = await itnryRepo.lockRecord(recordId);
-  if (!locked) {
-    logger.warn(`PNR ${pnr} already picked up by another worker — skipping`);
-    return;
-  }
+  logger.info(`━━━ START PNR: ${pnr} | Name: ${matchedName} | Worker: ${workerName} ━━━`);
 
   let lastError: Error | null = null;
   let result: AutomationResult | null = null;
+  let browserErrorOccurred = false;
+  const maxAttempts = ENV.MAX_RETRIES + 1; // 1 original + retries
 
-  for (let attempt = 1; attempt <= ENV.MAX_RETRIES + 1; attempt++) {
-    let context: BrowserContext | null = null;
-
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      logger.info(`PNR ${pnr} — attempt ${attempt}/${ENV.MAX_RETRIES + 1}`);
-
-      // Fresh browser context per attempt (isolates cookies, storage)
-      // context = await browser.newContext({
-      //   viewport: { width: 1366, height: 768 },
-      //   userAgent:
-      //     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-      // });
-
-      // const page = await browser.newPage();
+      logger.info(`PNR ${pnr} — attempt ${attempt}/${maxAttempts}`);
 
       result = await runIndigoAutomation(page, pnr, matchedName);
 
       logger.info(
-        `PNR ${pnr} — automation result: ${result.finalStatus} | msg: "${result.rawMessage.substring(0, 80)}"`
+        `PNR ${pnr} — result: ${result.finalStatus} | msg: "${result.rawMessage.substring(0, 100)}"`
       );
 
-      // Business result obtained — no retry needed regardless of status
+      // Got a business result — done, no retry needed
       break;
     } catch (error: any) {
       lastError = error;
-      logger.error(`PNR ${pnr} — attempt ${attempt} failed: ${error.message}`);
 
-      // Only retry system errors
-      if (!isSystemError(error) || attempt > ENV.MAX_RETRIES) {
+      if (isBrowserError(error)) {
+        browserErrorOccurred = true;
         logger.error(
-          `PNR ${pnr} — ${
-            isSystemError(error)
-              ? "max retries exhausted"
-              : "non-retryable error"
-          }`
+          `PNR ${pnr} — BROWSER ERROR attempt ${attempt}/${maxAttempts}: ${error.message}`
         );
+
+        if (attempt < maxAttempts) {
+          logger.info(`PNR ${pnr} — retrying in 5s (browser error)...`);
+          await delay(5000);
+          continue;
+        }
+
+        logger.error(
+          `PNR ${pnr} — BROWSER ERROR: all ${maxAttempts} attempts exhausted. Marking as browserError.`
+        );
+      } else {
+        // Non-browser error — do NOT retry
+        logger.error(
+          `PNR ${pnr} — APPLICATION ERROR (non-retryable): ${error.message}`
+        );
+        logger.error(`PNR ${pnr} — stack: ${error.stack}`);
         break;
       }
+    }
+  }
 
-      logger.info(`PNR ${pnr} — retrying in 5s...`);
-      await delay(5000);
-    } 
-    // finally {
-    //   if (page) {
-    //     await context.close().catch(() => {});
-    //   }
-    // }
+  // ── Determine final status ────────────────────────────────────────────────
+
+  let finalStatus: "Success" | "Error" | "Already_Refunded" | "browserError";
+
+  if (result) {
+    finalStatus = result.finalStatus;
+  } else if (browserErrorOccurred) {
+    finalStatus = "browserError";
+  } else {
+    finalStatus = "Error";
   }
 
   // ── Save result to refund_book ────────────────────────────────────────────
+
   const refundInput: RefundBookInput = {
     pnr,
     matchedName,
     batchId: record.batchId,
+    refundWorker: workerName,
     RefundAmt_from_itnry: record.RefundAmount ?? null,
     Refund_Amt_from_UI_message: result?.Refund_Amt_from_UI_message ?? null,
     currency_from_itnry: record.Currency ?? null,
     currency_from_UI_message: result?.currency_from_UI_message ?? null,
-    finalStatus: result?.finalStatus ?? "Error",
+    finalStatus,
     rawMessage: result?.rawMessage ?? lastError?.message ?? "Unknown error",
   };
 
   await refundRepo.saveResult(refundInput);
 
   // ── Update itnry status ───────────────────────────────────────────────────
+
   if (result && result.finalStatus !== "Error") {
     await itnryRepo.markProcessed(recordId);
   } else {
     await itnryRepo.markFailed(recordId);
   }
 
-  logger.info(`━━━ END processing PNR: ${pnr} | Status: ${refundInput.finalStatus} ━━━`);
+  logger.info(`━━━ END PNR: ${pnr} | Status: ${finalStatus} ━━━`);
 }
 
-// ── Main worker entry point ──────────────────────────────────────────────────
+// ── Single worker loop ──────────────────────────────────────────────────────
 
-export async function runRefundWorker(batchId: string): Promise<void> {
-  logger.info(`========================================`);
-  logger.info(`Refund Worker starting for batchId: ${batchId}`);
-  logger.info(`========================================`);
+interface WorkerStats {
+  processed: number;
+  failed: number;
+}
 
-  // Fetch eligible records
-  const records = await itnryRepo.fetchEligibleRecords(batchId);
+async function runSingleWorker(
+  browser: Browser,
+  workerName: string,
+  workerId: string,
+  batchId: string,
+  seq: number
+): Promise<WorkerStats> {
+  const stats: WorkerStats = { processed: 0, failed: 0 };
 
-  if (records.length === 0) {
-    logger.info("No eligible records found — worker exiting");
-    return;
-  }
+  logger.info(`[Worker-${seq}] ${workerName} starting...`);
 
-  logger.info(`Found ${records.length} records to process`);
+  // Mark worker IN_PROGRESS
+  await refundWorkerRepo.markInProgress(workerId);
 
-  // Launch ONE shared browser instance (reused across all records)
-  const browser = await chromium.launchPersistentContext('C:\\Users\\Shreyas\\AppData\\Local\\Google\\Chrome\\User Data\\Profile 25',{
-    headless: ENV.BROWSER_HEADLESS,
-    slowMo: ENV.BROWSER_SLOW_MO_MS,
-    channel: 'chrome',
-    args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-blink-features=AutomationControlled",
-    ],
-  });
-
-  logger.info("Browser launched");
+  // Create isolated browser context + page for this worker
+  const context = await browser.newContext();
+  const page = await context.newPage();
 
   try {
-    // Reuse a single page across all records — only navigation changes, no new tabs
-    const page = browser.pages().length > 0 ? browser.pages()[0] : await browser.newPage();
+    // Infinite loop: fetch → process → update → repeat
+    while (true) {
+      // Atomically fetch and lock one task
+      const task = await itnryRepo.fetchAndLockTask(batchId, workerName);
 
-    // Process records sequentially — IndiGo rate-limits concurrent sessions
-    for (let i = 0; i < records.length; i++) {
-      const record = records[i];
+      if (!task) {
+        logger.info(`[Worker-${seq}] ${workerName}: No more tasks available — stopping`);
+        break;
+      }
+
+      stats.processed++;
       logger.info(
-        `Processing record ${i + 1}/${records.length}: PNR=${record.pnr}`
+        `[Worker-${seq}] Task #${stats.processed} — PNR: ${task.pnr} | Worker: ${workerName}`
       );
 
       try {
-        await processRecord(page, record);
+        await processRecord(page, task, workerName);
       } catch (error: any) {
-        // Catch-all: should not happen (processRecord handles its own errors)
-        // but ensures one bad record doesn't kill the entire batch
+        stats.failed++;
         logger.error(
-          `Unhandled error processing PNR ${record.pnr}: ${error.message}`
+          `[Worker-${seq}] Unhandled error for PNR ${task.pnr}: ${error.message}`
         );
+        logger.error(`[Worker-${seq}] Stack: ${error.stack}`);
       }
 
-      // Inter-record delay to avoid rate limiting (skip after last record)
-      if (i < records.length - 1 && ENV.INTER_RECORD_DELAY_MS > 0) {
+      // Inter-record delay to avoid rate limiting
+      if (ENV.INTER_RECORD_DELAY_MS > 0) {
         logger.debug(
-          `Waiting ${ENV.INTER_RECORD_DELAY_MS}ms before next record...`
+          `[Worker-${seq}] Waiting ${ENV.INTER_RECORD_DELAY_MS}ms before next task...`
         );
         await delay(ENV.INTER_RECORD_DELAY_MS);
       }
     }
+
+    // All tasks done — mark worker COMPLETED
+    await refundWorkerRepo.markCompleted(workerId);
+    logger.info(
+      `[Worker-${seq}] ${workerName} → COMPLETED | Processed: ${stats.processed} | Failed: ${stats.failed}`
+    );
+  } catch (error: any) {
+    logger.error(`[Worker-${seq}] ${workerName} fatal error: ${error.message}`);
+    logger.error(`[Worker-${seq}] Stack: ${error.stack}`);
+    await refundWorkerRepo.markFailed(workerId);
+  } finally {
+    await context.close();
+    logger.info(`[Worker-${seq}] ${workerName} context closed`);
+  }
+
+  return stats;
+}
+
+// ── Main entry point: multi-worker system ───────────────────────────────────
+
+export async function runMultiWorkerSystem(
+  batchId: string,
+  workerCount: number
+): Promise<void> {
+  logger.info(`========================================`);
+  logger.info(`Multi-Worker System starting`);
+  logger.info(`Batch: ${batchId} | Workers: ${workerCount}`);
+  logger.info(`========================================`);
+
+  // ── Step 1: Create worker records in DB ───────────────────────────────────
+
+  const workers: { name: string; id: string; seq: number }[] = [];
+
+  for (let i = 1; i <= workerCount; i++) {
+    const name = `${batchId}-w${i}`;
+    const worker = await refundWorkerRepo.createWorker(name, i, batchId);
+    workers.push({
+      name,
+      id: (worker._id as any).toString(),
+      seq: i,
+    });
+  }
+
+  logger.info(`Created ${workers.length} worker records in DB`);
+
+  // ── Step 2: Launch ONE browser instance ───────────────────────────────────
+
+  let browser: Browser;
+  try {
+    browser = await chromium.launch({
+      headless: ENV.BROWSER_HEADLESS,
+      slowMo: ENV.BROWSER_SLOW_MO_MS,
+      channel: "chrome",
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+      ],
+    });
+  } catch (error: any) {
+    logger.error(`Failed to launch browser: ${error.message}`);
+    logger.error(`Browser launch stack: ${error.stack}`);
+
+    // Mark all workers as FAILED since browser didn't start
+    for (const w of workers) {
+      await refundWorkerRepo.markFailed(w.id);
+    }
+    throw error;
+  }
+
+  logger.info("Browser launched successfully — spawning workers");
+
+  // ── Step 3: Spawn all workers concurrently ────────────────────────────────
+
+  try {
+    const results = await Promise.allSettled(
+      workers.map((w) =>
+        runSingleWorker(browser, w.name, w.id, batchId, w.seq)
+      )
+    );
+
+    // ── Summary ─────────────────────────────────────────────────────────────
+
+    logger.info(`========================================`);
+    logger.info(`All workers finished — Summary:`);
+
+    let totalProcessed = 0;
+    let totalFailed = 0;
+
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      if (r.status === "fulfilled") {
+        totalProcessed += r.value.processed;
+        totalFailed += r.value.failed;
+        logger.info(
+          `  Worker-${i + 1} (${workers[i].name}): processed=${r.value.processed}, failed=${r.value.failed}`
+        );
+      } else {
+        logger.error(
+          `  Worker-${i + 1} (${workers[i].name}): CRASHED — ${r.reason}`
+        );
+      }
+    }
+
+    logger.info(`Total: processed=${totalProcessed}, failed=${totalFailed}`);
+    logger.info(`========================================`);
   } finally {
     await browser.close();
     logger.info("Browser closed");
   }
-
-  logger.info(`========================================`);
-  logger.info(`Refund Worker finished for batchId: ${batchId}`);
-  logger.info(`========================================`);
 }
 
-// ── Utility ──────────────────────────────────────────────────────────────────
+// ── Utility ─────────────────────────────────────────────────────────────────
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

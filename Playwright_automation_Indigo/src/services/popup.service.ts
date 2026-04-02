@@ -50,7 +50,9 @@ export interface PopupResult {
  */
 export async function capturePopupOnClick(
   page: Page,
-  noShowBtn: Locator
+  noShowBtn: Locator,
+  pnr: string,
+  matchedName: string,
 ): Promise<PopupResult> {
   logger.info("Setting up popup listeners BEFORE clicking No-Show button");
 
@@ -83,6 +85,7 @@ export async function capturePopupOnClick(
         })
     )
   ).catch(() => null);
+
 
   // ── Strategy 3: MutationObserver capturing any DOM text changes ───────────
   const mutationPromise = page
@@ -135,6 +138,10 @@ export async function capturePopupOnClick(
     fallbackPromise,
     mutationPromise,
   ]);
+  await page.screenshot({
+    path: `screenshots/popups/${pnr}_${matchedName}.png`,
+    fullPage: true
+  });
 
   // Pick the first non-null result (priority: primary > fallback > mutation)
   let captured: { text: string; capturedVia: string } | null = null;

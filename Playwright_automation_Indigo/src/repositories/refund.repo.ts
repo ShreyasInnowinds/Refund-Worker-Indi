@@ -7,11 +7,12 @@ export interface IRefundBook extends Document {
   pnr: string;
   matchedName: string | null;
   batchId: string;
+  refundWorker: string | null;
   RefundAmt_from_itnry: number | null;
   Refund_Amt_from_UI_message: number | null;
   currency_from_itnry: string | null;
   currency_from_UI_message: string | null;
-  finalStatus: "Success" | "Error" | "Already_Refunded";
+  finalStatus: "Success" | "Error" | "Already_Refunded" | "browserError";
   rawMessage: string | null;
   processedAt: Date;
 }
@@ -23,13 +24,14 @@ const refundBookSchema = new Schema(
     pnr: { type: String, required: true },
     matchedName: { type: String, default: null },
     batchId: { type: String, required: true },
+    refundWorker: { type: String, default: null },
     RefundAmt_from_itnry: { type: Number, default: null },
     Refund_Amt_from_UI_message: { type: Number, default: null },
     currency_from_itnry: { type: String, default: null },
     currency_from_UI_message: { type: String, default: null },
     finalStatus: {
       type: String,
-      enum: ["Success", "Error", "Already_Refunded"],
+      enum: ["Success", "Error", "Already_Refunded", "browserError"],
       required: true,
     },
     rawMessage: { type: String, default: null },
@@ -53,11 +55,12 @@ export interface RefundBookInput {
   pnr: string;
   matchedName: string | null;
   batchId: string;
+  refundWorker: string | null;
   RefundAmt_from_itnry: number | null;
   Refund_Amt_from_UI_message: number | null;
   currency_from_itnry: string | null;
   currency_from_UI_message: string | null;
-  finalStatus: "Success" | "Error" | "Already_Refunded";
+  finalStatus: "Success" | "Error" | "Already_Refunded" | "browserError";
   rawMessage: string | null;
 }
 

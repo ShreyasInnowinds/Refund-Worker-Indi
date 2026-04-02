@@ -77,18 +77,19 @@ export class ItnryRepo {
   }
 
   /**
-   * Atomically lock a record: set refundWorkerStatus = "PROCESSING"
-   * Only locks if current status is still NEW or IN_PROGRESS (prevents double-pick).
+   * Atomically lock a record: set refundWorkerStatus = "IN_PROGRESS"
+   * Only locks if current status is NEW (prevents double-pick).
    */
-  async lockRecord(recordId: string): Promise<IItnry | null> {
+  async lockRecord(recordId: string, workerName: string): Promise<IItnry | null> {
     const locked = await ItnryModel.findOneAndUpdate(
       {
         _id: recordId,
-        refundWorkerStatus: { $in: ["NEW", "IN_PROGRESS"] },
+        refundWorkerStatus: "NEW",
       },
       {
         $set: {
-          refundWorkerStatus: "PROCESSING",
+          refundWorkerStatus: "IN_PROGRESS",
+          lockedBy: workerName,
           LockedAt: new Date(),
         },
       },
@@ -96,7 +97,7 @@ export class ItnryRepo {
     );
 
     if (locked) {
-      logger.debug(`Locked record: ${locked.pnr} (${recordId})`);
+      logger.debug(`Locked record: ${locked.pnr} (${recordId}) by ${workerName}`);
     } else {
       logger.warn(`Failed to lock record ${recordId} — already picked up`);
     }
@@ -118,6 +119,38 @@ export class ItnryRepo {
       }
     );
     logger.debug(`Marked record ${recordId} as PROCESSED`);
+  }
+
+  /**
+   * Atomically fetch and lock ONE eligible task from the queue.
+   * Uses findOneAndUpdate so no two workers can pick the same task.
+   */
+  async fetchAndLockTask(
+    batchId: string,
+    workerName: string
+  ): Promise<IItnry | null> {
+    const task = await ItnryModel.findOneAndUpdate(
+      {
+        batchId,
+        Status: "NoShow",
+        refundWorkerStatus: "NEW",
+      },
+      {
+        $set: {
+          refundWorkerStatus: "IN_PROGRESS",
+          lockedBy: workerName,
+          LockedAt: new Date(),
+        },
+      },
+      { new: true }
+    );
+
+    if (task) {
+      logger.debug(
+        `Fetched & locked task: PNR=${task.pnr} by ${workerName}`
+      );
+    }
+    return task;
   }
 
   /**
