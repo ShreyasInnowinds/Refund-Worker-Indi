@@ -1,0 +1,24 @@
+{
+  "name": "indigo-refund-worker",
+  "version": "1.0.0",
+  "description": "IndiGo No-Show tax refund automation worker using Playwright + MongoDB",
+  "main": "dist/scripts/runWorker.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "ts-node src/scripts/runWorker.ts",
+    "start:prod": "node dist/scripts/runWorker.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "mongoose": "^8.2.0",
+    "playwright": "^1.44.0",
+    "winston": "^3.13.0",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/yargs": "^17.0.32",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
