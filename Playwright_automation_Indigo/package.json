@@ -10,6 +10,7 @@
   },
   "dependencies": {
     "dotenv": "^16.4.5",
+    "mongodb": "^7.2.0",
     "mongoose": "^8.2.0",
     "playwright": "^1.44.0",
     "winston": "^3.13.0",

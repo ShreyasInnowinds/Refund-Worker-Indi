@@ -1,5 +1,6 @@
 import mongoose, { Schema, Document } from "mongoose";
 import { logger } from "../utils/logger";
+import { getDB } from "../config/db";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,45 @@ export class RefundWorkerRepo {
       logger.error(`Worker not found: ${name}`);
     }
     return worker;
+  }
+
+  /**
+   * Fetch an idle worker for the given batch.
+   */
+  async fetchIdleByBatch(batchId: string): Promise<IRefundWorker | null> {
+    const worker = await RefundWorkerModel.findOne({
+      assignedBatch: batchId,
+      status: "IDEL",
+    }).lean<IRefundWorker>();
+    if (worker) {
+      logger.info(
+        `Found idle worker: ${worker.name} | assignedBatch: ${batchId}`
+      );
+    } else {
+      logger.error(`No idle worker found for batch: ${batchId}`);
+    }
+    return worker;
+  }
+
+  /**
+   * Fetch up to `limit` idle workers for the given batch, ordered by seq.
+   */
+  async fetchIdleListByBatch(
+    batchId: string,
+    limit: number
+  ): Promise<IRefundWorker[]> {
+    const db = getDB();
+    const workers = await RefundWorkerModel.find({
+      assignedBatch: batchId,
+      status: "IDEL",
+    })
+      .sort({ seq: 1 })
+      .limit(limit)
+      .lean<IRefundWorker[]>();
+    logger.info(
+      `Found ${workers.length} idle worker(s) for batch ${batchId} (requested ${limit})`
+    );
+    return workers;
   }
 
   /**

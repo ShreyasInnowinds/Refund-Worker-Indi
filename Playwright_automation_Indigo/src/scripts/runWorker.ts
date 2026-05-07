@@ -14,9 +14,10 @@ import * as readline from "readline";
 import yargs from "yargs";
 import { hideBin } from "yargs/helpers";
 import { ENV } from "../config/env";
-import { connectDB, disconnectDB } from "../config/db";
+import { closeDB, connectDB, getDB } from "../config/db";
 import { runMultiWorkerSystem } from "../services/worker.service";
 import { logger } from "../utils/logger";
+import dotenv from 'dotenv';
 
 function askQuestion(question: string): Promise<string> {
   const rl = readline.createInterface({
@@ -72,9 +73,11 @@ async function main(): Promise<void> {
   logger.info(`MongoDB: ${ENV.MONGO_URI}/${ENV.DB_NAME}`);
   logger.info(`Headless: ${ENV.BROWSER_HEADLESS} | MaxRetries: ${ENV.MAX_RETRIES}`);
 
+  const URI=process.env.MONGO_URI || 'mongodb://localhost:27017/tvc-app';
+  const db = process.env.DB_NAME || "tvc_prod";
   try {
     // Connect to MongoDB
-    await connectDB();
+    await connectDB(URI, db);
 
     // Run multi-worker system
     await runMultiWorkerSystem(batchId, workerCount);
@@ -85,7 +88,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
   } finally {
     // Always disconnect MongoDB
-    await disconnectDB();
+    await closeDB();
     logger.info("Shutdown complete");
   }
 }

@@ -22,7 +22,7 @@
  *   - Each worker handles its own errors — no worker crashes the system
  */
 
-import { chromium, Browser, Page } from "playwright";
+import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { ItnryRepo, IItnry } from "../repositories/itnry.repo";
 import { RefundRepo, RefundBookInput } from "../repositories/refund.repo";
 import { RefundWorkerRepo } from "../repositories/refundWorker.repo";
@@ -52,12 +52,77 @@ function isBrowserError(error: Error): boolean {
   );
 }
 
+function isSomethingWentWrong(text: string | null | undefined): boolean {
+  if (!text) return false;
+  return text.toLowerCase().includes("something went wrong");
+}
+
+// Sentinel thrown when the second consecutive "Something went wrong" hits.
+// runSingleWorker catches this by name and stops the worker loop.
+class StopExecutionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StopExecutionError";
+  }
+}
+
+async function runAutomationWithBrowserRetry(
+  page: Page,
+  pnr: string,
+  matchedName: string
+): Promise<{
+  result: AutomationResult | null;
+  lastError: Error | null;
+  browserErrorOccurred: boolean;
+}> {
+  let lastError: Error | null = null;
+  let result: AutomationResult | null = null;
+  let browserErrorOccurred = false;
+  const maxAttempts = ENV.MAX_RETRIES + 1;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      logger.info(`PNR ${pnr} — attempt ${attempt}/${maxAttempts}`);
+      result = await runIndigoAutomation(page, pnr, matchedName);
+      logger.info(
+        `PNR ${pnr} — result: ${result.finalStatus} | msg: "${result.rawMessage.substring(0, 100)}"`
+      );
+      break;
+    } catch (error: any) {
+      lastError = error;
+      if (isBrowserError(error)) {
+        browserErrorOccurred = true;
+        logger.error(
+          `PNR ${pnr} — BROWSER ERROR attempt ${attempt}/${maxAttempts}: ${error.message}`
+        );
+        if (attempt < maxAttempts) {
+          logger.info(`PNR ${pnr} — retrying in 5s (browser error)...`);
+          await delay(5000);
+          continue;
+        }
+        logger.error(
+          `PNR ${pnr} — BROWSER ERROR: all ${maxAttempts} attempts exhausted.`
+        );
+      } else {
+        logger.error(
+          `PNR ${pnr} — APPLICATION ERROR (non-retryable): ${error.message}`
+        );
+        logger.error(`PNR ${pnr} — stack: ${error.stack}`);
+        break;
+      }
+    }
+  }
+
+  return { result, lastError, browserErrorOccurred };
+}
+
 // ── Process a single record (already locked by fetchAndLockTask) ────────────
 
 async function processRecord(
   page: Page,
   record: IItnry,
-  workerName: string
+  workerName: string,
+  refreshSession: () => Promise<Page>
 ): Promise<void> {
   const pnr = record.pnr;
   const matchedName = record.matchedName || "";
@@ -65,49 +130,24 @@ async function processRecord(
 
   logger.info(`━━━ START PNR: ${pnr} | Name: ${matchedName} | Worker: ${workerName} ━━━`);
 
-  let lastError: Error | null = null;
-  let result: AutomationResult | null = null;
-  let browserErrorOccurred = false;
-  const maxAttempts = ENV.MAX_RETRIES + 1; // 1 original + retries
+  // First pass
+  let { result, lastError, browserErrorOccurred } =
+    await runAutomationWithBrowserRetry(page, pnr, matchedName);
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      logger.info(`PNR ${pnr} — attempt ${attempt}/${maxAttempts}`);
+  // If we hit "Something went wrong", refresh the browser context and retry once.
+  // If the second pass also returns "Something went wrong", save the result
+  // and throw StopExecutionError so the worker loop exits.
+  let stopAfterSave = false;
+  if (isSomethingWentWrong(result?.rawMessage)) {
+    logger.warn(
+      `PNR ${pnr} — popup said "Something went wrong" — refreshing browser context (auth token refresh) and retrying once`
+    );
+    page = await refreshSession();
+    ({ result, lastError, browserErrorOccurred } =
+      await runAutomationWithBrowserRetry(page, pnr, matchedName));
 
-      result = await runIndigoAutomation(page, pnr, matchedName);
-
-      logger.info(
-        `PNR ${pnr} — result: ${result.finalStatus} | msg: "${result.rawMessage.substring(0, 100)}"`
-      );
-
-      // Got a business result — done, no retry needed
-      break;
-    } catch (error: any) {
-      lastError = error;
-
-      if (isBrowserError(error)) {
-        browserErrorOccurred = true;
-        logger.error(
-          `PNR ${pnr} — BROWSER ERROR attempt ${attempt}/${maxAttempts}: ${error.message}`
-        );
-
-        if (attempt < maxAttempts) {
-          logger.info(`PNR ${pnr} — retrying in 5s (browser error)...`);
-          await delay(5000);
-          continue;
-        }
-
-        logger.error(
-          `PNR ${pnr} — BROWSER ERROR: all ${maxAttempts} attempts exhausted. Marking as browserError.`
-        );
-      } else {
-        // Non-browser error — do NOT retry
-        logger.error(
-          `PNR ${pnr} — APPLICATION ERROR (non-retryable): ${error.message}`
-        );
-        logger.error(`PNR ${pnr} — stack: ${error.stack}`);
-        break;
-      }
+    if (isSomethingWentWrong(result?.rawMessage)) {
+      stopAfterSave = true;
     }
   }
 
@@ -143,12 +183,27 @@ async function processRecord(
   // ── Update itnry status ───────────────────────────────────────────────────
 
   if (result && result.finalStatus !== "Error") {
-    await itnryRepo.markProcessed(recordId);
+    const refundStatus =
+      result.finalStatus === "Already_Refunded"
+        ? "Already_Refunded"
+        : "Refund_Processed";
+    await itnryRepo.markProcessed(
+      recordId,
+      refundStatus,
+      result.rawMessage,
+      result.Refund_Amt_from_UI_message
+    );
   } else {
     await itnryRepo.markFailed(recordId);
   }
 
   logger.info(`━━━ END PNR: ${pnr} | Status: ${finalStatus} ━━━`);
+
+  if (stopAfterSave) {
+    throw new StopExecutionError(
+      `session refreshed but again msg: "Something went wrong" so stopping execution`
+    );
+  }
 }
 
 // ── Single worker loop ──────────────────────────────────────────────────────
@@ -172,9 +227,26 @@ async function runSingleWorker(
   // Mark worker IN_PROGRESS
   await refundWorkerRepo.markInProgress(workerId);
 
-  // Create isolated browser context + page for this worker
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  // Create isolated browser context + page for this worker.
+  // These are `let` so refreshSession() can swap them in-place.
+  let context: BrowserContext = await browser.newContext();
+  let page: Page = await context.newPage();
+
+  const refreshSession = async (): Promise<Page> => {
+    logger.warn(
+      `[Worker-${seq}] ${workerName}: closing browser context & opening a fresh one (auth token refresh)`
+    );
+    try {
+      await context.close();
+    } catch (err: any) {
+      logger.warn(`[Worker-${seq}] context.close() during refresh failed: ${err.message}`);
+    }
+    context = await browser.newContext();
+    page = await context.newPage();
+    return page;
+  };
+
+  let stoppedByExecutionHalt = false;
 
   try {
     // Infinite loop: fetch → process → update → repeat
@@ -193,8 +265,13 @@ async function runSingleWorker(
       );
 
       try {
-        await processRecord(page, task, workerName);
+        await processRecord(page, task, workerName, refreshSession);
       } catch (error: any) {
+        if (error instanceof StopExecutionError) {
+          logger.error(`[Worker-${seq}] ${error.message}`);
+          stoppedByExecutionHalt = true;
+          break;
+        }
         stats.failed++;
         logger.error(
           `[Worker-${seq}] Unhandled error for PNR ${task.pnr}: ${error.message}`
@@ -211,17 +288,27 @@ async function runSingleWorker(
       }
     }
 
-    // All tasks done — mark worker COMPLETED
-    await refundWorkerRepo.markCompleted(workerId);
-    logger.info(
-      `[Worker-${seq}] ${workerName} → COMPLETED | Processed: ${stats.processed} | Failed: ${stats.failed}`
-    );
+    if (stoppedByExecutionHalt) {
+      await refundWorkerRepo.markFailed(workerId);
+      logger.error(
+        `[Worker-${seq}] ${workerName} → HALTED after consecutive "Something went wrong" | Processed: ${stats.processed} | Failed: ${stats.failed}`
+      );
+    } else {
+      await refundWorkerRepo.markCompleted(workerId);
+      logger.info(
+        `[Worker-${seq}] ${workerName} → COMPLETED | Processed: ${stats.processed} | Failed: ${stats.failed}`
+      );
+    }
   } catch (error: any) {
     logger.error(`[Worker-${seq}] ${workerName} fatal error: ${error.message}`);
     logger.error(`[Worker-${seq}] Stack: ${error.stack}`);
     await refundWorkerRepo.markFailed(workerId);
   } finally {
-    await context.close();
+    try {
+      await context.close();
+    } catch {
+      // already closed during refresh; ignore
+    }
     logger.info(`[Worker-${seq}] ${workerName} context closed`);
   }
 
@@ -239,21 +326,31 @@ export async function runMultiWorkerSystem(
   logger.info(`Batch: ${batchId} | Workers: ${workerCount}`);
   logger.info(`========================================`);
 
-  // ── Step 1: Create worker records in DB ───────────────────────────────────
+  // ── Step 1: Fetch idle worker records from DB ─────────────────────────────
 
-  const workers: { name: string; id: string; seq: number }[] = [];
+  const idleWorkers = await refundWorkerRepo.fetchIdleListByBatch(
+    batchId,
+    workerCount
+  );
 
-  for (let i = 1; i <= workerCount; i++) {
-    const name = `${batchId}-w${i}`;
-    const worker = await refundWorkerRepo.createWorker(name, i, batchId);
-    workers.push({
-      name,
-      id: (worker._id as any).toString(),
-      seq: i,
-    });
+  if (idleWorkers.length === 0) {
+    logger.error(`No IDEL workers found for batch ${batchId} — aborting`);
+    return;
   }
 
-  logger.info(`Created ${workers.length} worker records in DB`);
+  if (idleWorkers.length < workerCount) {
+    logger.warn(
+      `Requested ${workerCount} workers but only ${idleWorkers.length} IDEL worker(s) available for batch ${batchId}`
+    );
+  }
+
+  const workers = idleWorkers.map((w) => ({
+    name: w.name,
+    id: (w._id as any).toString(),
+    seq: w.seq,
+  }));
+
+  logger.info(`Fetched ${workers.length} idle worker record(s) from DB`);
 
   // ── Step 2: Launch ONE browser instance ───────────────────────────────────
 
@@ -274,9 +371,9 @@ export async function runMultiWorkerSystem(
     logger.error(`Browser launch stack: ${error.stack}`);
 
     // Mark all workers as FAILED since browser didn't start
-    for (const w of workers) {
-      await refundWorkerRepo.markFailed(w.id);
-    }
+    // for (const w of workers) {
+    //   await refundWorkerRepo.markFailed(w.id);
+    // }
     throw error;
   }
 

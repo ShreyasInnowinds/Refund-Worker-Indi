@@ -1,3 +1,10 @@
+run: 
+npm run start
+
+enter: batchId
+workers: 1, ....
+
+
 You are a senior backend + automation engineer.
 
 Build a complete production-grade system for automating IndiGo No-Show tax refund processing.

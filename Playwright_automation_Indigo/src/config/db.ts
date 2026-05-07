@@ -1,32 +1,29 @@
-import mongoose from "mongoose";
-import { ENV } from "./env";
-import { logger } from "../utils/logger";
+import { MongoClient, Db } from 'mongodb';
+import mongoose from 'mongoose';
+import { logger } from '../utils/logger';
 
-let isConnected = false;
+let client: MongoClient;
+let db: Db;
 
-export async function connectDB(): Promise<void> {
-  if (isConnected) {
-    logger.warn("MongoDB already connected — skipping");
-    return;
-  }
+export async function connectDB(uri: string, dbName: string): Promise<void> {
+  client = new MongoClient(uri);
+  await client.connect();
+  db = client.db(dbName);
+  logger.info(`Native MongoClient connected — database: ${dbName}`);
 
-  const uri = `${ENV.MONGO_URI}/${ENV.DB_NAME}`;
-  logger.info(`Connecting to MongoDB: ${ENV.MONGO_URI}/${ENV.DB_NAME}`);
-
-  await mongoose.connect(uri, {
-    maxPoolSize: 10,
-    serverSelectionTimeoutMS: 5000,
-    socketTimeoutMS: 45000,
-  });
-
-  isConnected = true;
-  logger.info("MongoDB connected successfully");
+  // Mongoose models in repositories still rely on this connection.
+  await mongoose.connect(uri, { dbName });
+  logger.info(`Mongoose connected — database: ${dbName}`);
 }
 
-export async function disconnectDB(): Promise<void> {
-  if (!isConnected) return;
+export function getDB(): Db {
+  if (!db) throw new Error('Database not initialized. Call connectDB first.');
+  return db;
+}
 
-  await mongoose.disconnect();
-  isConnected = false;
-  logger.info("MongoDB disconnected");
+export async function closeDB(): Promise<void> {
+  if (mongoose.connection.readyState !== 0) {
+    await mongoose.disconnect();
+  }
+  if (client) await client.close();
 }

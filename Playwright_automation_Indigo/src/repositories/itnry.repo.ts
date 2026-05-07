@@ -19,8 +19,11 @@ export interface IItnry extends Document {
   metadata: any;
   refundWorkerStatus: string;
   lockedBy: string | null;
-  LockedAt: Date | null;
+  lockedAt: Date | null;
   processedAt: Date | null;
+  refundStatus: string | null;
+  message: string | null;
+  Msg_refundAmt: number | null;
 }
 
 // ── Schema ───────────────────────────────────────────────────────────────────
@@ -46,15 +49,18 @@ const itnrySchema = new Schema(
       default: "NEW",
     },
     lockedBy: { type: String, default: null },
-    LockedAt: { type: Date, default: null },
+    lockedAt: { type: Date, default: null },
     processedAt: { type: Date, default: null },
+    refundStatus: { type: String, default: null },
+    message: { type: String, default: null },
+    Msg_refundAmt: { type: Number, default: null },
   },
   { collection: "itnry", timestamps: false }
 );
 
 itnrySchema.index({ batchId: 1, Status: 1, refundWorkerStatus: 1 });
 
-const ItnryModel = mongoose.model<IItnry>("Itnry", itnrySchema);
+const ItnryModel = mongoose.model<IItnry>("itnry", itnrySchema);
 
 // ── Repository ───────────────────────────────────────────────────────────────
 
@@ -68,6 +74,7 @@ export class ItnryRepo {
       batchId,
       Status: "NoShow",
       refundWorkerStatus: { $in: ["NEW", "IN_PROGRESS"] },
+      isToShowTaxRefund: true,
     }).lean<IItnry[]>();
 
     logger.info(
@@ -85,12 +92,13 @@ export class ItnryRepo {
       {
         _id: recordId,
         refundWorkerStatus: "NEW",
+        isToShowTaxRefund: true,
       },
       {
         $set: {
           refundWorkerStatus: "IN_PROGRESS",
           lockedBy: workerName,
-          LockedAt: new Date(),
+          lockedAt: new Date(),
         },
       },
       { new: true }
@@ -107,7 +115,12 @@ export class ItnryRepo {
   /**
    * Mark record as PROCESSED after successful automation.
    */
-  async markProcessed(recordId: string): Promise<void> {
+  async markProcessed(
+    recordId: string,
+    refundStatus: "Refund_Processed" | "Already_Refunded",
+    message: string | null,
+    msgRefundAmt: number | null
+  ): Promise<void> {
     await ItnryModel.updateOne(
       { _id: recordId },
       {
@@ -115,10 +128,15 @@ export class ItnryRepo {
           refundWorkerStatus: "PROCESSED",
           isRefundProcessed: true,
           processedAt: new Date(),
+          refundStatus,
+          message,
+          Msg_refundAmt: msgRefundAmt,
         },
       }
     );
-    logger.debug(`Marked record ${recordId} as PROCESSED`);
+    logger.debug(
+      `Marked record ${recordId} as PROCESSED | refundStatus=${refundStatus} | Msg_refundAmt=${msgRefundAmt}`
+    );
   }
 
   /**
@@ -129,20 +147,23 @@ export class ItnryRepo {
     batchId: string,
     workerName: string
   ): Promise<IItnry | null> {
+    // Pick FAILED records first (re-tries), then NEW.
+    // "FAILED" < "NEW" alphabetically, so ascending sort puts them first.
     const task = await ItnryModel.findOneAndUpdate(
       {
         batchId,
         Status: "NoShow",
-        refundWorkerStatus: "NEW",
+        refundWorkerStatus: { $in: ["NEW", "FAILED"] },
+        isToShowTaxRefund: true,
       },
       {
         $set: {
           refundWorkerStatus: "IN_PROGRESS",
           lockedBy: workerName,
-          LockedAt: new Date(),
+          lockedAt: new Date(),
         },
       },
-      { new: true }
+      { new: true, sort: { refundWorkerStatus: 1 } }
     );
 
     if (task) {
